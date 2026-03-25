@@ -11,8 +11,13 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "").strip()
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN tidak ditemukan! Cek variable Railway.")
+if not CLAUDE_API_KEY:
+    raise ValueError("CLAUDE_API_KEY tidak ditemukan! Cek variable Railway.")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Session storage per chat
