@@ -353,9 +353,9 @@ async def save_story_db(member_id: str, story_text: str, photo_urls: list, chat_
         if photo_urls:
             for i, url in enumerate(photo_urls):
                 res = await db.insert("story_photos", {
-                    "story_id":    story["id"],
-                    "photo_url":   url,
-                    "order_index": i+1
+                    "story_id":   story["id"],
+                    "storage_url": url,
+                    "photo_order": i+1
                 })
                 if not res:
                     logger.error(f"save_story_db: gagal simpan story_photo url={url}")
