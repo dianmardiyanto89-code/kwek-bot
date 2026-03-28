@@ -334,8 +334,12 @@ async def save_story_db(member_id: str, story_text: str, photo_urls: list) -> di
             title = line; break
     try:
         story = await db.insert("stories", {
-            "member_id": member_id, "title": title, "content": story_text,
-            "photo_count": len(photo_urls), "mood": "happy", "tags": ["keluarga", "momen"]
+            "author_id":   member_id,
+            "title":       title,
+            "story_text":  story_text,
+            "photo_count": len(photo_urls),
+            "mood":        "happy",
+            "tags":        ["keluarga", "momen"]
         })
         if not story:
             logger.error(f"save_story_db: insert stories gagal, member_id={member_id}")
@@ -344,7 +348,9 @@ async def save_story_db(member_id: str, story_text: str, photo_urls: list) -> di
         if photo_urls:
             for i, url in enumerate(photo_urls):
                 res = await db.insert("story_photos", {
-                    "story_id": story["id"], "photo_url": url, "order_index": i+1
+                    "story_id":    story["id"],
+                    "photo_url":   url,
+                    "order_index": i+1
                 })
                 if not res:
                     logger.error(f"save_story_db: gagal simpan story_photo url={url}")
@@ -393,7 +399,10 @@ async def save_task_db(member_id: str, parsed: dict) -> dict | None:
     })
 
 async def log_activity(member_id: str, action: str, details: dict = None):
-    await db.insert("bot_activity_log", {"member_id": member_id, "action_type": action, "details": details or {}})
+    await db.insert("bot_activity_log", {
+        "action_type":   action,
+        "action_detail": details or {}
+    })
 
 # ─── REPLY HELPERS ───────────────────────────────────────────────────────────
 async def reply_finance(update: Update, parsed: dict, tx_type: str, extra: str = ""):
