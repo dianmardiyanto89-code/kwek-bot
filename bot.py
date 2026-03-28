@@ -169,14 +169,15 @@ def get_sess(chat_id):
         sessions[chat_id] = {
             "mode": "idle", "photos": [], "photo_bytes": [],
             "photo_urls": [], "history": [], "q_count": 0, "general": [],
-            "awaiting_journal": False
+            "awaiting_journal": False, "story_mode": "interview"
         }
     return sessions[chat_id]
 
 def reset_sess(chat_id):
     sessions[chat_id] = {
         "mode": "idle", "photos": [], "photo_bytes": [], "photo_urls": [],
-        "history": [], "q_count": 0, "general": [], "awaiting_journal": False
+        "history": [], "q_count": 0, "general": [], "awaiting_journal": False,
+        "story_mode": "interview"
     }
 
 # ─── CLAUDE API ──────────────────────────────────────────────────────────────
@@ -512,8 +513,64 @@ async def job_malam(context):
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data  = query.data
+    user  = query.from_user
 
-    data = query.data
+    # ── Foto pilihan handler ──
+    if data.startswith("foto_"):
+        chat_id = query.message.chat_id
+        sess    = get_sess(chat_id)
+        member  = await ensure_member(user.id, user.username, user.full_name)
+        member_id = member["id"] if member else "unknown"
+        b64       = sess.pop("pending_b64", None)
+        raw_bytes = sess.pop("pending_bytes", None)
+
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        if data == "foto_ceritacepat":
+            if b64 and raw_bytes:
+                sess["mode"] = "collecting"
+                sess["story_mode"] = "quick"
+                sess["photos"].append(b64)
+                sess["photo_bytes"].append(raw_bytes)
+                await ctx.bot.send_message(chat_id,
+                    "⚡ *Mode Cerita Cepat!*
+
+Foto masuk (1/8).
+"
+                    "Kirim foto lagi atau /selesai lalu tulis ceritamu!",
+                    parse_mode="Markdown")
+        elif data == "foto_ceritalengkap":
+            if b64 and raw_bytes:
+                sess["mode"] = "collecting"
+                sess["story_mode"] = "interview"
+                sess["photos"].append(b64)
+                sess["photo_bytes"].append(raw_bytes)
+                await ctx.bot.send_message(chat_id,
+                    "🎬 *Mode Cerita Lengkap!*
+
+Foto masuk (1/8).
+"
+                    "Kirim foto lagi atau /selesai untuk mulai wawancara!",
+                    parse_mode="Markdown")
+        elif data == "foto_reminder":
+            if raw_bytes:
+                photo_url = await upload_photo(raw_bytes, "misc", member_id)
+                await db.insert("bot_activity_log", {
+                    "action_type": "photo_reminder",
+                    "action_detail": {"photo_url": photo_url}
+                })
+                await ctx.bot.send_message(chat_id, "📌 Foto tersimpan sebagai pengingat!")
+        elif data == "foto_log":
+            if raw_bytes:
+                photo_url = await upload_photo(raw_bytes, "misc", member_id)
+                await db.insert("bot_activity_log", {
+                    "action_type": "photo_log",
+                    "action_detail": {"photo_url": photo_url}
+                })
+                await ctx.bot.send_message(chat_id, "📋 Foto tersimpan sebagai log aktivitas!")
+        return
+
     if not data.startswith("ch_"): return
 
     channel = data[3:]  # ambil nama channel
@@ -698,11 +755,40 @@ async def cmd_tugas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_cerita(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "*Dua Cara Buat Cerita:*\n\n"
+        "📸 */ceritalengkap* — Kirim foto, Kwek wawancara, cerita jadi lebih kaya\n"
+        "⚡ */ceritacepat* — Kirim foto + tulismu sendiri, Kwek langsung simpan\n\n"
+        "_Pilih salah satu ya!_",
+        parse_mode="Markdown"
+    )
+
+async def cmd_ceritalengkap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     reset_sess(chat_id)
-    get_sess(chat_id)["mode"] = "collecting"
+    sess = get_sess(chat_id)
+    sess["mode"] = "collecting"
+    sess["story_mode"] = "interview"
     await update.message.reply_text(
-        "*Sesi Cerita Dimulai!*\n\nKirim foto-foto momen kalian (2-8 foto).\nSetelah semua foto, ketik /selesai ya!",
+        "*Sesi Cerita Lengkap Dimulai!*\n\n"
+        "Kirim foto-foto momen kalian (2-8 foto).\n"
+        "Setelah semua foto, ketik /selesai ya!\n\n"
+        "_Kwek akan wawancara untuk menggali cerita lebih dalam_ 🎬",
+        parse_mode="Markdown"
+    )
+
+async def cmd_ceritacepat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    reset_sess(chat_id)
+    sess = get_sess(chat_id)
+    sess["mode"] = "collecting"
+    sess["story_mode"] = "quick"
+    await update.message.reply_text(
+        "*Mode Cerita Cepat!*\n\n"
+        "1️⃣ Kirim foto momennya (1-8 foto)\n"
+        "2️⃣ Ketik /selesai\n"
+        "3️⃣ Tulis ceritamu — Kwek langsung simpan!\n\n"
+        "_Tidak ada wawancara, langsung jadi_ ⚡",
         parse_mode="Markdown"
     )
 
@@ -710,11 +796,25 @@ async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sess    = get_sess(chat_id)
     if sess["mode"] != "collecting":
-        await update.message.reply_text("Belum ada sesi foto aktif. Ketik /cerita dulu!"); return
-    if len(sess["photos"]) < 2:
-        await update.message.reply_text("Minimal 2 foto dulu ya!"); return
-    sess["mode"] = "interviewing"
+        await update.message.reply_text("Belum ada sesi foto aktif. Ketik /ceritalengkap atau /ceritacepat dulu!"); return
+    if len(sess["photos"]) < 1:
+        await update.message.reply_text("Minimal 1 foto dulu ya!"); return
     n = len(sess["photos"])
+    # Mode cerita cepat — minta teks cerita dari user
+    if sess.get("story_mode") == "quick":
+        sess["mode"] = "awaiting_story_text"
+        await update.message.reply_text(
+            f"✅ *{n} foto diterima!*
+
+"
+            "Sekarang tulis ceritamu — bebas, natural, dari hati.
+"
+            "Kwek akan simpan jadi kenangan indah keluarga 📝",
+            parse_mode="Markdown"
+        )
+        return
+    # Mode interview lengkap
+    sess["mode"] = "interviewing"
     await update.message.reply_text(f"{n} foto diterima! Sebentar, aku analisis...")
     try:
         q = await call_claude(
@@ -726,12 +826,27 @@ async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(q)
     except Exception as e:
         logger.error(e)
-        await update.message.reply_text("Kwak! Ada gangguan. Coba /cerita lagi ya.")
+        await update.message.reply_text("Kwak! Ada gangguan. Coba /ceritalengkap lagi ya.")
         reset_sess(chat_id)
 
 async def cmd_batal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    reset_sess(update.effective_chat.id)
-    await update.message.reply_text("Sesi dibatalkan. Ketik /cerita untuk mulai lagi!")
+    chat_id = update.effective_chat.id
+    sess    = get_sess(chat_id)
+    # Kalau sedang interview, tawari simpan langsung
+    if sess["mode"] == "interviewing" and sess["photos"]:
+        reset_sess(chat_id)
+        await update.message.reply_text(
+            "Sesi dibatalkan.\n\n"
+            "💡 _Untuk cerita cepat tanpa interview: kirim foto + tulis caption langsung!_",
+            parse_mode="Markdown"
+        )
+    else:
+        reset_sess(chat_id)
+        await update.message.reply_text(
+            "Sesi dibatalkan. Ketik /cerita untuk mulai lagi!\n\n"
+            "💡 _Tips: Kirim foto + caption untuk simpan cerita instan!_",
+            parse_mode="Markdown"
+        )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user   = update.effective_user
@@ -739,12 +854,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not member:
         await update.message.reply_text("Kwak! Tidak bisa ambil data."); return
     mid      = member["id"]
-    stories  = await db.select("stories",              f"member_id=eq.{mid}&select=id")
+    stories  = await db.select("stories",              f"author_id=eq.{mid}&select=id")
     txns     = await db.select("finance_transactions", f"recorded_by=eq.{mid}&select=id")
     photos   = await db.select("story_photos",         "select=id")
     tasks    = await db.select("tasks",                f"assigned_to=eq.{mid}&status=eq.pending&select=id")
     rems     = await db.select("reminders",            f"target_member_id=eq.{mid}&is_active=eq.true&select=id")
-    journals = await db.select("daily_journal",        f"member_id=eq.{mid}&select=id")
+    journals = await db.select("daily_journal",        f"author_id=eq.{mid}&select=id")
     await update.message.reply_text(
         f"*Status Kwek Family System*\n\n"
         f"Nama: {member.get('full_name','-')}\n"
@@ -817,8 +932,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reset_sess(chat_id)
         photo_url = await upload_photo(raw_bytes, "misc", member_id)
         await db.insert("bot_activity_log", {
-            "member_id": member_id, "action_type": "photo_misc",
-            "details": {"photo_url": photo_url}
+            "action_type": "photo_misc", "action_detail": {"photo_url": photo_url}
         })
         await update.message.reply_text("Foto tersimpan sebagai pengingat!")
         return
@@ -833,11 +947,37 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    sess["mode"] = "collecting"
-    sess["photos"].append(b64)
-    sess["photo_bytes"].append(raw_bytes)
+    # Foto dengan caption → langsung simpan sebagai cerita tanpa interview
+    caption = update.message.caption
+    if caption and len(caption.strip()) > 5:
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await update.message.reply_text("📸 Ada caption! Langsung aku simpan sebagai cerita...")
+        photo_url = await upload_photo(raw_bytes, "stories", member_id)
+        photo_urls = [photo_url] if photo_url else []
+        story_text = caption.strip()
+        saved = await save_story_db(member_id, story_text, photo_urls)
+        story_id = saved["id"] if saved else "?"
+        await update.message.reply_text(
+            f"✅ *Cerita tersimpan!*\n\n_{story_text}_\n\nID: #{story_id}",
+            parse_mode="Markdown"
+        )
+        await log_activity(member_id, "story_quick", {"story_id": story_id})
+        return
+
+    # Foto tanpa command — tanya mau diapakan
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Cerita Cepat", callback_data="foto_ceritacepat"),
+         InlineKeyboardButton("🎬 Cerita + Wawancara", callback_data="foto_ceritalengkap")],
+        [InlineKeyboardButton("📌 Reminder / Pengingat", callback_data="foto_reminder"),
+         InlineKeyboardButton("📋 Log Aktivitas", callback_data="foto_log")],
+    ])
+    sess["pending_b64"]   = b64
+    sess["pending_bytes"] = raw_bytes
+    await update.message.reply_text("📸 Foto masuk! Mau diapakan?", reply_markup=keyboard)
     await update.message.reply_text(
-        "Foto masuk! Kirim semua foto momennya dulu.\nSudah semua? Ketik /selesai!"
+        "Foto masuk! Kirim semua foto momennya dulu.\nSudah semua? Ketik /selesai!\n\n"
+        "_💡 Tips: Kirim foto + caption langsung untuk simpan cerita tanpa interview!_",
+        parse_mode="Markdown"
     )
 
 # ─── TEXT HANDLER ────────────────────────────────────────────────────────────
@@ -872,6 +1012,29 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(e)
             await update.message.reply_text("Koneksi bermasalah, coba lagi ya!")
+        return
+
+    # ── Mode awaiting story text (cerita cepat) ──
+    if sess.get("mode") == "awaiting_story_text":
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        await update.message.reply_text("✍️ Kwek simpan ceritamu...")
+        photo_urls = []
+        for raw_bytes in sess["photo_bytes"]:
+            url = await upload_photo(raw_bytes, "stories", member_id)
+            if url: photo_urls.append(url)
+        saved    = await save_story_db(member_id, text, photo_urls)
+        story_id = saved["id"] if saved else "?"
+        reset_sess(chat_id)
+        await update.message.reply_text(
+            f"✅ *Cerita tersimpan!*
+
+_{text[:200]}{'...' if len(text)>200 else ''}_
+
+"
+            f"📸 {len(photo_urls)} foto · ID: #{story_id}",
+            parse_mode="Markdown"
+        )
+        await log_activity(member_id, "story_quick", {"story_id": story_id})
         return
 
     # ── Mode awaiting journal ──
@@ -997,6 +1160,7 @@ def main():
     for cmd, fn in [
         ("start", cmd_start), ("help", cmd_help), ("cerita", cmd_cerita),
         ("selesai", cmd_selesai), ("batal", cmd_batal), ("status", cmd_status),
+        ("ceritalengkap", cmd_ceritalengkap), ("ceritacepat", cmd_ceritacepat),
         ("keuangan", cmd_keuangan), ("struk", cmd_struk), ("foto", cmd_foto),
         ("reminder", cmd_reminder), ("tugas", cmd_tugas),
         ("channel", cmd_channel), ("kabar", cmd_kabar), ("jurnal", cmd_jurnal),
