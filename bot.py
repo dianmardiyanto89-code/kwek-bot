@@ -327,15 +327,19 @@ async def save_finance(member_id: str, parsed: dict, tx_type: str, photo_url: st
         "source":      "photo" if photo_url else "bot"
     })
 
-async def save_story_db(member_id: str, story_text: str, photo_urls: list) -> dict | None:
+async def save_story_db(member_id: str, story_text: str, photo_urls: list, chat_id: int = None) -> dict | None:
     title = "Cerita Keluarga"
     for line in story_text.split("\n"):
         line = line.strip().replace("*", "").replace("_", "")
         if line and 5 < len(line) < 80 and not line.startswith("#"):
             title = line; break
+    import random, string
+    story_code = "KWK-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     try:
         story = await db.insert("stories", {
             "author_id":   member_id,
+            "story_code":  story_code,
+            "chat_id":     chat_id or GROUP_CHAT_ID or 0,
             "title":       title,
             "story_text":  story_text,
             "photo_count": len(photo_urls),
@@ -399,11 +403,14 @@ async def save_task_db(member_id: str, parsed: dict) -> dict | None:
         "status":      "pending", "source": "bot"
     })
 
-async def log_activity(member_id: str, action: str, details: dict = None):
-    await db.insert("bot_activity_log", {
+async def log_activity(member_id: str, action: str, details: dict = None, chat_id: int = None):
+    data = {
         "action_type":   action,
         "action_detail": details or {}
-    })
+    }
+    if chat_id:
+        data["chat_id"] = chat_id
+    await db.insert("bot_activity_log", data)
 
 # ─── REPLY HELPERS ───────────────────────────────────────────────────────────
 async def reply_finance(update: Update, parsed: dict, tx_type: str, extra: str = ""):
@@ -942,7 +949,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         photo_url = await upload_photo(raw_bytes, "stories", member_id)
         photo_urls = [photo_url] if photo_url else []
         story_text = caption.strip()
-        saved = await save_story_db(member_id, story_text, photo_urls)
+        saved = await save_story_db(member_id, story_text, photo_urls, update.effective_chat.id)
         story_id = saved["id"] if saved else "?"
         await update.message.reply_text(
             f"✅ *Cerita tersimpan!*\n\n_{story_text}_\n\nID: #{story_id}",
@@ -1009,7 +1016,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for raw_bytes in sess["photo_bytes"]:
             url = await upload_photo(raw_bytes, "stories", member_id)
             if url: photo_urls.append(url)
-        saved    = await save_story_db(member_id, text, photo_urls)
+        saved    = await save_story_db(member_id, text, photo_urls, chat_id)
         story_id = saved["id"] if saved else "?"
         reset_sess(chat_id)
         await update.message.reply_text(
@@ -1125,7 +1132,8 @@ async def generate_story(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess: d
     )
     try:
         story    = await call_claude(messages=[{"role": "user", "content": prompt}], system=SYSTEM_STORY, images=sess["photos"][:4])
-        saved    = await save_story_db(member_id, story, photo_urls)
+        chat_id_val = update.effective_chat.id if update.effective_chat else None
+        saved    = await save_story_db(member_id, story, photo_urls, chat_id_val)
         story_id = saved["id"] if saved else "?"
         await update.message.reply_text(f"*CERITA KALIAN SUDAH JADI!*\n\n{story}", parse_mode="Markdown")
         await update.message.reply_text(f"Cerita tersimpan (ID: #{story_id})\n{len(photo_urls)} foto aman di storage.\n\nKetik /cerita untuk buat cerita baru!")
