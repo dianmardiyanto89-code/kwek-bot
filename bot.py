@@ -70,7 +70,7 @@ REMINDER_WORDS        = {"ingatkan", "ingatin", "reminder", "remind", "inget", "
 TASK_WORDS            = {"todo", "tugas", "kerjain", "task"}
 JOURNAL_WORDS         = {"kabar", "curhat", "cerita", "hari", "jurnal"}
 
-FINANCE_SYMBOL_RE = re.compile(r'^([+\-])(\d[\d.,]*[kKmMrRbB]*)\s+(.+)$')
+FINANCE_SYMBOL_RE = re.compile(r'^([+\-])\s*(\d[\d.,]*[kKmMrRbB]*)\s+(.+)$')
 
 def detect_trigger(text: str) -> str:
     t          = text.strip().lower()
@@ -328,14 +328,28 @@ async def save_story_db(member_id: str, story_text: str, photo_urls: list) -> di
         line = line.strip().replace("*", "").replace("_", "")
         if line and 5 < len(line) < 80 and not line.startswith("#"):
             title = line; break
-    story = await db.insert("stories", {
-        "member_id": member_id, "title": title, "content": story_text,
-        "photo_count": len(photo_urls), "mood": "happy", "tags": ["keluarga", "momen"]
-    })
-    if story and photo_urls:
-        for i, url in enumerate(photo_urls):
-            await db.insert("story_photos", {"story_id": story["id"], "photo_url": url, "order_index": i+1})
-    return story
+    try:
+        story = await db.insert("stories", {
+            "member_id": member_id, "title": title, "content": story_text,
+            "photo_count": len(photo_urls), "mood": "happy", "tags": ["keluarga", "momen"]
+        })
+        if not story:
+            logger.error(f"save_story_db: insert stories gagal, member_id={member_id}")
+            return None
+        logger.info(f"save_story_db: story tersimpan id={story.get('id')}")
+        if photo_urls:
+            for i, url in enumerate(photo_urls):
+                res = await db.insert("story_photos", {
+                    "story_id": story["id"], "photo_url": url, "order_index": i+1
+                })
+                if not res:
+                    logger.error(f"save_story_db: gagal simpan story_photo url={url}")
+                else:
+                    logger.info(f"save_story_db: photo {i+1} tersimpan")
+        return story
+    except Exception as e:
+        logger.error(f"save_story_db exception: {e}")
+        return None
 
 async def save_journal(member_id: str, raw_text: str, curated_text: str, mood_score: int, channel: str) -> dict | None:
     return await db.insert("daily_journal", {
@@ -927,10 +941,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def generate_story(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess: dict, member_id: str):
     await update.message.reply_text("Mengupload foto ke storage...")
     photo_urls = []
-    for raw_bytes in sess["photo_bytes"]:
+    logger.info(f"generate_story: mulai upload {len(sess['photo_bytes'])} foto untuk member {member_id}")
+    for i, raw_bytes in enumerate(sess["photo_bytes"]):
         url = await upload_photo(raw_bytes, "stories", member_id)
-        if url: photo_urls.append(url)
+        if url:
+            photo_urls.append(url)
+            logger.info(f"generate_story: foto {i+1} upload OK → {url}")
+        else:
+            logger.error(f"generate_story: foto {i+1} GAGAL upload")
 
+    logger.info(f"generate_story: {len(photo_urls)}/{len(sess['photos'])} foto terupload")
     await update.message.reply_text(f"{len(photo_urls)}/{len(sess['photos'])} foto tersimpan!\nMenulis cerita...")
 
     qa = "\n".join([
