@@ -1,10 +1,10 @@
 import os
 import logging
 import base64
+import httpx
 import json
 import re
-from datetime import datetime, timezone, timedelta
-import httpx
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -14,100 +14,153 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============================================
-# ENVIRONMENT VARIABLES
-# ============================================
+# ─── ENV VARIABLES ───────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "").strip()
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()       # https://xxx.supabase.co
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()       # service_role key
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "").strip()
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN tidak ditemukan!")
-if not CLAUDE_API_KEY:
-    raise ValueError("CLAUDE_API_KEY tidak ditemukan!")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.warning("⚠️ SUPABASE_URL/SUPABASE_KEY belum diset — data TIDAK akan tersimpan!")
+if not TELEGRAM_TOKEN: raise ValueError("TELEGRAM_TOKEN tidak ditemukan!")
+if not CLAUDE_API_KEY:  raise ValueError("CLAUDE_API_KEY tidak ditemukan!")
+if not SUPABASE_URL:    raise ValueError("SUPABASE_URL tidak ditemukan!")
+if not SUPABASE_KEY:    raise ValueError("SUPABASE_KEY tidak ditemukan!")
 
-# ============================================
-# SUPABASE REST API HELPER
-# ============================================
+# ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
 class SupabaseClient:
-    """Lightweight Supabase REST client — no extra dependencies needed."""
-
     def __init__(self, url: str, key: str):
-        self.base_url = f"{url}/rest/v1"
+        self.url = url.rstrip("/")
         self.headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "Prefer": "return=representation"
         }
+        self.storage_headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+        }
 
     async def insert(self, table: str, data: dict) -> dict | None:
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"{self.base_url}/{table}",
-                    headers=self.headers,
-                    json=data
-                )
-                resp.raise_for_status()
-                rows = resp.json()
-                return rows[0] if rows else None
-        except Exception as e:
-            logger.error(f"❌ Supabase insert {table}: {e}")
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{self.url}/rest/v1/{table}",
+                headers=self.headers, json=data
+            )
+            if r.status_code in (200, 201):
+                result = r.json()
+                return result[0] if isinstance(result, list) and result else result
+            logger.error(f"Supabase insert error {r.status_code}: {r.text}")
             return None
 
-    async def select(self, table: str, query_params: str = "", limit: int = 10) -> list:
-        try:
-            url = f"{self.base_url}/{table}?{query_params}&limit={limit}" if query_params else f"{self.base_url}/{table}?limit={limit}"
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(url, headers=self.headers)
-                resp.raise_for_status()
-                return resp.json()
-        except Exception as e:
-            logger.error(f"❌ Supabase select {table}: {e}")
+    async def select(self, table: str, query: str = "") -> list:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{self.url}/rest/v1/{table}?{query}",
+                headers=self.headers
+            )
+            if r.status_code == 200:
+                return r.json()
+            logger.error(f"Supabase select error {r.status_code}: {r.text}")
             return []
 
-    async def update(self, table: str, match_params: str, data: dict) -> dict | None:
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.patch(
-                    f"{self.base_url}/{table}?{match_params}",
-                    headers=self.headers,
-                    json=data
-                )
-                resp.raise_for_status()
-                rows = resp.json()
-                return rows[0] if rows else None
-        except Exception as e:
-            logger.error(f"❌ Supabase update {table}: {e}")
+    async def update(self, table: str, match: str, data: dict) -> bool:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.patch(
+                f"{self.url}/rest/v1/{table}?{match}",
+                headers=self.headers, json=data
+            )
+            return r.status_code in (200, 204)
+
+    async def upload_photo(self, bucket: str, path: str, image_bytes: bytes, content_type: str = "image/jpeg") -> str | None:
+        """Upload foto ke Supabase Storage, return public URL."""
+        upload_headers = {
+            **self.storage_headers,
+            "Content-Type": content_type,
+            "x-upsert": "true"
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{self.url}/storage/v1/object/{bucket}/{path}",
+                headers=upload_headers,
+                content=image_bytes
+            )
+            if r.status_code in (200, 201):
+                # Return URL yang bisa diakses dengan service_role key
+                return f"{self.url}/storage/v1/object/{bucket}/{path}"
+            logger.error(f"Storage upload error {r.status_code}: {r.text}")
             return None
 
+    async def get_storage_stats(self, bucket: str) -> dict:
+        """Ambil info ukuran storage bucket."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{self.url}/storage/v1/bucket/{bucket}",
+                headers=self.storage_headers
+            )
+            if r.status_code == 200:
+                return r.json()
+            return {}
 
-# Initialize Supabase client
-db = SupabaseClient(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+db = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
 
-# ============================================
-# SESSION & SYSTEM PROMPTS
-# ============================================
+# ─── STORAGE MONITORING ───────────────────────────────────────────────────────
+STORAGE_LIMIT_GB = 1.0  # Supabase free tier
+STORAGE_ALERTS = [0.70, 0.85, 0.95]
+
+async def check_storage_alert(current_bytes: int) -> str | None:
+    """Return pesan alert jika mendekati batas, None jika aman."""
+    ratio = current_bytes / (STORAGE_LIMIT_GB * 1024 ** 3)
+    for threshold in sorted(STORAGE_ALERTS, reverse=True):
+        if ratio >= threshold:
+            pct = int(threshold * 100)
+            used_mb = current_bytes / (1024 ** 2)
+            return (
+                f"⚠️ *Storage Alert {pct}%*\n"
+                f"Sudah terpakai: {used_mb:.1f} MB dari {int(STORAGE_LIMIT_GB * 1024)} MB\n"
+                f"Pertimbangkan untuk migrasi ke Cloudflare R2."
+            )
+    return None
+
+# ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
 sessions = {}
 
+def get_sess(chat_id):
+    if chat_id not in sessions:
+        sessions[chat_id] = {
+            "mode": "idle",
+            "photos": [],        # base64 untuk Claude Vision
+            "photo_bytes": [],   # raw bytes untuk upload Storage
+            "photo_urls": [],    # URL setelah upload
+            "history": [],
+            "q_count": 0,
+            "general": [],
+            "context": "story"   # story | finance | misc
+        }
+    return sessions[chat_id]
+
+def reset_sess(chat_id):
+    sessions[chat_id] = {
+        "mode": "idle",
+        "photos": [], "photo_bytes": [], "photo_urls": [],
+        "history": [], "q_count": 0, "general": [],
+        "context": "story"
+    }
+
+# ─── CLAUDE API ───────────────────────────────────────────────────────────────
 SYSTEM_KWEK = """Kamu adalah Kwek 🦆, asisten keluarga yang ceria, hangat, cerdas, dan sedikit lucu.
 Kamu berbicara Bahasa Indonesia yang natural, santai, seperti teman dekat keluarga.
 Gunakan emoji secukupnya. Jangan terlalu formal.
 
 Kemampuanmu:
 1. SUTRADARA CERITA: Saat ada foto, kamu interview keluarga lalu buatkan story indah
-2. ASISTEN UMUM: Jawab pertanyaan apapun — pengetahuan umum, saran, ide, dll
-3. PENGINGAT & CATATAN: Bantu catat hal penting yang disebutkan keluarga
-4. CATAT KEUANGAN: Saat user bilang pengeluaran, catat dengan format yang rapi
+2. ASISTEN UMUM: Jawab pertanyaan apapun
+3. CATAT KEUANGAN: Deteksi dan catat transaksi keuangan dari chat natural
+4. PENGINGAT & CATATAN: Bantu catat hal penting
 
 Saat mode interview story:
 - Analisis foto dengan detail dan empati
-- Ajukan pertanyaan personal, spesifik, dan hangat — bukan generik
+- Ajukan pertanyaan personal, spesifik, dan hangat
 - Fokus pada emosi, detail unik, momen lucu atau mengharukan
 - Maksimal 4 pertanyaan sebelum buat cerita"""
 
@@ -116,44 +169,37 @@ Tulis cerita berdasarkan foto dan hasil interview.
 Gunakan Bahasa Indonesia yang indah, personal, menyentuh — tidak berlebihan.
 Cerita harus terasa seperti ditulis oleh seseorang yang benar-benar hadir di momen itu."""
 
-SYSTEM_FINANCE_PARSER = """Kamu adalah parser keuangan. Dari pesan user, extract data transaksi.
-Balas HANYA dalam format JSON (tanpa markdown, tanpa penjelasan):
+SYSTEM_FINANCE_PARSER = """Kamu adalah parser keuangan. Extract informasi transaksi dari teks.
+Balas HANYA dengan JSON valid, tanpa teks lain, tanpa markdown.
+
+Format JSON:
 {
-  "is_finance": true/false,
-  "amount": angka dalam rupiah (integer, tanpa titik/koma),
+  "is_transaction": true/false,
+  "amount": 35000,
   "type": "expense" atau "income",
-  "description": "deskripsi singkat",
-  "category_hint": "salah satu dari: makanan, transport, belanja_rumah, sekolah, kesehatan, hiburan, tagihan, pakaian, tabungan, lainnya",
-  "merchant": "nama toko/tempat jika disebutkan",
-  "payment_method": "cash/transfer/gopay/ovo/credit_card/lainnya jika disebutkan"
+  "description": "makan siang",
+  "category": "Makanan & Minuman",
+  "notes": "catatan tambahan atau null"
 }
 
-Contoh input → output:
-"beli makan siang 35rb di warteg" → {"is_finance":true,"amount":35000,"type":"expense","description":"makan siang","category_hint":"makanan","merchant":"warteg","payment_method":""}
-"gaji masuk 5jt" → {"is_finance":true,"amount":5000000,"type":"income","description":"gaji","category_hint":"lainnya","merchant":"","payment_method":"transfer"}
-"halo kwek apa kabar" → {"is_finance":false}
-"tolong buatkan cerita" → {"is_finance":false}
-"""
+Kategori yang tersedia: Makanan & Minuman, Transportasi, Belanja, Kesehatan, Pendidikan, Hiburan, Tagihan & Utilitas, Tabungan & Investasi, Pemasukan, Lainnya
 
-# Category name mapping (matches seed data in DB)
-CATEGORY_MAP = {
-    "makanan": "Makanan & Minuman",
-    "transport": "Transport",
-    "belanja_rumah": "Belanja Rumah",
-    "sekolah": "Sekolah & Pendidikan",
-    "kesehatan": "Kesehatan & Obat",
-    "hiburan": "Hiburan",
-    "tagihan": "Tagihan & Utilitas",
-    "pakaian": "Pakaian",
-    "tabungan": "Tabungan & Investasi",
-    "lainnya": "Lainnya",
+Contoh input: "beli makan 35rb" → is_transaction: true, amount: 35000, type: expense
+Contoh input: "gajian 5jt" → is_transaction: true, amount: 5000000, type: income
+Contoh input: "cuaca hari ini" → is_transaction: false"""
+
+SYSTEM_PHOTO_CONTEXT = """Kamu adalah Kwek 🦆. Analisis foto yang dikirim dan tentukan konteksnya.
+Balas HANYA dengan JSON valid:
+{
+  "context": "story" atau "finance" atau "misc",
+  "description": "deskripsi singkat foto dalam 1 kalimat"
 }
 
+- story: foto momen keluarga, liburan, acara, anak-anak, dll
+- finance: struk belanja, nota, tagihan, receipt
+- misc: foto objek, dokumen, pengingat, kunci, dll"""
 
-# ============================================
-# CLAUDE API CALL
-# ============================================
-async def call_claude(messages: list, system: str, images: list = None, max_tokens: int = 1000) -> str:
+async def call_claude(messages: list, system: str, images: list = None) -> str:
     headers = {
         "Content-Type": "application/json",
         "x-api-key": CLAUDE_API_KEY,
@@ -174,7 +220,7 @@ async def call_claude(messages: list, system: str, images: list = None, max_toke
 
     payload = {
         "model": "claude-sonnet-4-20250514",
-        "max_tokens": max_tokens,
+        "max_tokens": 1000,
         "system": system,
         "messages": api_messages
     }
@@ -183,238 +229,211 @@ async def call_claude(messages: list, system: str, images: list = None, max_toke
         resp.raise_for_status()
         return resp.json()["content"][0]["text"]
 
-
-# ============================================
-# MEMBER AUTO-REGISTER
-# ============================================
-async def ensure_member(user) -> str | None:
-    """Auto-register anggota keluarga saat pertama interaksi. Return member UUID."""
-    if not db:
-        return None
-    existing = await db.select("family_members", f"telegram_id=eq.{user.id}", limit=1)
+# ─── SUPABASE HELPERS ─────────────────────────────────────────────────────────
+async def ensure_member(telegram_id: int, username: str = None, full_name: str = None) -> dict | None:
+    existing = await db.select("family_members", f"telegram_id=eq.{telegram_id}")
     if existing:
-        return existing[0]["id"]
-    member = await db.insert("family_members", {
-        "telegram_id": user.id,
-        "name": user.first_name or "Unknown",
-        "full_name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+        return existing[0]
+    return await db.insert("family_members", {
+        "telegram_id": telegram_id,
+        "username": username or f"user_{telegram_id}",
+        "full_name": full_name or "Anggota Keluarga",
+        "role": "member"
     })
-    if member:
-        logger.info(f"👤 Member baru terdaftar: {member['name']} ({user.id})")
-        return member["id"]
-    return None
 
+async def upload_photo_to_storage(image_bytes: bytes, folder: str, member_id: int = None) -> str | None:
+    """Upload foto ke Supabase Storage, return URL."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    mid = member_id or "unknown"
+    path = f"{folder}/{mid}/{ts}.jpg"
+    url = await db.upload_photo("photos", path, image_bytes)
+    return url
 
-# ============================================
-# FINANCE HELPER
-# ============================================
-async def get_category_id(hint: str) -> str | None:
-    if not db:
-        return None
-    cat_name = CATEGORY_MAP.get(hint, "Lainnya")
-    cats = await db.select("finance_categories", f"name=eq.{cat_name}", limit=1)
-    if cats:
-        return cats[0]["id"]
-    cats = await db.select("finance_categories", "name=eq.Lainnya", limit=1)
-    return cats[0]["id"] if cats else None
+async def save_story(member_id: int, story_text: str, photo_urls: list, interview_data: list) -> dict | None:
+    # Extract judul dari cerita
+    title = "Cerita Keluarga"
+    lines = story_text.split("\n")
+    for line in lines:
+        line = line.strip().replace("*", "")
+        if line and len(line) > 5 and len(line) < 80:
+            title = line
+            break
 
+    story = await db.insert("stories", {
+        "member_id": member_id,
+        "title": title,
+        "content": story_text,
+        "photo_count": len(photo_urls),
+        "mood": "happy",
+        "tags": ["keluarga", "momen"]
+    })
 
-async def try_parse_finance(text: str, user, chat_id: int) -> str | None:
-    """Coba parse pesan sebagai transaksi keuangan. Return reply jika berhasil."""
+    if story and photo_urls:
+        story_id = story.get("id")
+        for i, url in enumerate(photo_urls):
+            await db.insert("story_photos", {
+                "story_id": story_id,
+                "photo_url": url,
+                "order_index": i + 1
+            })
+
+    return story
+
+async def save_finance(member_id: int, parsed: dict, photo_url: str = None) -> dict | None:
+    cats = await db.select("finance_categories", f"name=eq.{parsed.get('category','Lainnya')}")
+    cat_id = cats[0]["id"] if cats else None
+
+    data = {
+        "member_id": member_id,
+        "type": parsed.get("type", "expense"),
+        "amount": parsed.get("amount", 0),
+        "description": parsed.get("description", ""),
+        "category_id": cat_id,
+        "notes": parsed.get("notes"),
+        "receipt_url": photo_url
+    }
+    return await db.insert("finance_transactions", data)
+
+async def save_misc_photo(member_id: int, photo_url: str, description: str) -> dict | None:
+    """Simpan foto misc ke bot_activity_log sebagai referensi."""
+    return await db.insert("bot_activity_log", {
+        "member_id": member_id,
+        "action_type": "photo_misc",
+        "details": {"photo_url": photo_url, "description": description}
+    })
+
+async def log_activity(member_id: int, action: str, details: dict = None):
+    await db.insert("bot_activity_log", {
+        "member_id": member_id,
+        "action_type": action,
+        "details": details or {}
+    })
+
+async def try_parse_finance(text: str) -> dict | None:
     try:
-        result_raw = await call_claude(
+        result = await call_claude(
             messages=[{"role": "user", "content": text}],
-            system=SYSTEM_FINANCE_PARSER,
-            max_tokens=300
+            system=SYSTEM_FINANCE_PARSER
         )
-        result_raw = result_raw.strip()
-        if result_raw.startswith("```"):
-            result_raw = result_raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-        result = json.loads(result_raw)
-
-        if not result.get("is_finance"):
-            return None
-
-        member_id = await ensure_member(user)
-        category_id = await get_category_id(result.get("category_hint", "lainnya"))
-
-        amount = result["amount"]
-        if result["type"] == "expense":
-            amount = -abs(amount)
-
-        tx = await db.insert("finance_transactions", {
-            "amount": amount,
-            "type": result["type"],
-            "category_id": category_id,
-            "description": result.get("description", ""),
-            "merchant": result.get("merchant", ""),
-            "payment_method": result.get("payment_method", ""),
-            "recorded_by": member_id,
-            "source": "bot_chat",
-        })
-
-        if tx:
-            abs_amount = abs(result["amount"])
-            emoji = "💸" if result["type"] == "expense" else "💰"
-            formatted = f"Rp {abs_amount:,.0f}".replace(",", ".")
-            cat_name = CATEGORY_MAP.get(result.get("category_hint", ""), "Lainnya")
-
-            await log_activity(chat_id, user.id, user.first_name, "finance_logged", {
-                "amount": amount, "description": result.get("description", ""), "category": cat_name
-            }, "finance_transactions", tx["id"])
-
-            merchant_line = f"Tempat: {result['merchant']}\n" if result.get("merchant") else ""
-            return (
-                f"{emoji} *Tercatat!*\n\n"
-                f"{'Pengeluaran' if result['type'] == 'expense' else 'Pemasukan'}: *{formatted}*\n"
-                f"Kategori: {cat_name}\n"
-                f"Keterangan: {result.get('description', '-')}\n"
-                f"{merchant_line}\n"
-                f"🦆 _Mau catat lagi atau tanya sesuatu?_"
-            )
-        return None
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.debug(f"Not a finance message: {e}")
-        return None
+        clean = result.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean)
+        return parsed if parsed.get("is_transaction") else None
     except Exception as e:
         logger.error(f"Finance parse error: {e}")
         return None
 
+async def detect_photo_context(image_b64: str) -> dict:
+    """Deteksi konteks foto: story / finance / misc."""
+    try:
+        result = await call_claude(
+            messages=[{"role": "user", "content": "Tentukan konteks foto ini."}],
+            system=SYSTEM_PHOTO_CONTEXT,
+            images=[image_b64]
+        )
+        clean = result.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except Exception:
+        return {"context": "story", "description": "foto keluarga"}
 
-# ============================================
-# ACTIVITY LOGGER
-# ============================================
-async def log_activity(chat_id, user_tg_id, user_name, action_type, detail=None, related_table=None, related_id=None):
-    if not db:
-        return
-    await db.insert("bot_activity_log", {
-        "chat_id": chat_id,
-        "user_telegram_id": user_tg_id,
-        "user_name": user_name or "",
-        "action_type": action_type,
-        "action_detail": json.dumps(detail) if detail else None,
-        "related_table": related_table,
-        "related_id": str(related_id) if related_id else None,
-    })
-
-
-# ============================================
-# SAVE STORY TO SUPABASE
-# ============================================
-async def save_story(chat_id, chat_title, author_name, author_tg_id,
-                     photo_count, story_text, interview_qa, member_id=None) -> dict | None:
-    if not db:
-        return None
-
-    wib = datetime.now(timezone(timedelta(hours=7)))
-    story_code = f"KWEK-{wib.strftime('%Y%m%d-%H%M%S')}"
-
-    title = ""
-    match = re.search(r'\*([^*]+)\*', story_text)
-    if match:
-        title = match.group(1).strip()
-    else:
-        title = story_text.split("\n")[0][:100].strip()
-
-    tags = re.findall(r'#(\w+)', story_text)
-
-    story = await db.insert("stories", {
-        "story_code": story_code,
-        "chat_id": chat_id,
-        "chat_title": chat_title or "",
-        "author_id": member_id,
-        "author_telegram_id": author_tg_id,
-        "author_name": author_name or "",
-        "photo_count": photo_count,
-        "title": title,
-        "story_text": story_text,
-        "interview_qa": interview_qa,
-        "tags": tags,
-    })
-
-    if story:
-        logger.info(f"✅ Cerita tersimpan: {story_code}")
-        await log_activity(chat_id, author_tg_id, author_name, "story_created", {
-            "story_code": story_code, "title": title, "photo_count": photo_count
-        }, "stories", story["id"])
-
-    return story
-
-
-# ============================================
-# SESSION MANAGEMENT
-# ============================================
-def get_sess(chat_id):
-    if chat_id not in sessions:
-        sessions[chat_id] = {
-            "mode": "idle", "photos": [], "history": [],
-            "q_count": 0, "general": [],
-            "story_author": None, "story_author_id": None, "story_member_uuid": None,
-        }
-    return sessions[chat_id]
-
-
-def reset_sess(chat_id):
-    sessions[chat_id] = {
-        "mode": "idle", "photos": [], "history": [],
-        "q_count": 0, "general": [],
-        "story_author": None, "story_author_id": None, "story_member_uuid": None,
-    }
-
-
-# ============================================
-# COMMAND HANDLERS
-# ============================================
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_member(update.effective_user)
+    user = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    await log_activity(member["id"] if member else 0, "start")
     await update.message.reply_text(
         "🦆 *Kwek datang!*\n\n"
         "Halo keluarga! Aku Kwek, teman setia kalian.\n\n"
         "Yang bisa aku lakukan:\n"
-        "📸 *Kirim foto* → Aku buatkan cerita indah\n"
+        "📸 *Kirim foto* → Cerita, catat struk, atau simpan pengingat\n"
         "💬 *Tanya apapun* → Aku jawab seperti asisten pribadi\n"
-        "💰 *Catat pengeluaran* → \"beli makan 35rb di warteg\"\n"
+        "💰 *Catat pengeluaran* → Tulis natural, aku yang proses\n"
         "📖 /cerita → Mulai sesi buat cerita\n"
-        "💰 /keuangan → Lihat ringkasan keuangan\n"
-        "📊 /status → Cek status database\n"
+        "📊 /status → Statistik data keluarga\n"
         "❓ /help → Panduan lengkap\n\n"
         "Kwek siap! 🦆✨",
         parse_mode="Markdown"
     )
 
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🦆 *Panduan Kwek*\n\n"
-        "*📸 Buat Cerita dari Foto:*\n"
-        "1. Kirim 2-8 foto ke sini\n"
-        "2. Kwek analisis & tanya beberapa hal\n"
-        "3. Jawab santai → cerita jadi!\n\n"
+        "*📸 Kirim Foto:*\n"
+        "Kwek otomatis deteksi jenis fotonya:\n"
+        "• Foto momen → Sesi cerita\n"
+        "• Struk belanja → Catat keuangan\n"
+        "• Foto lain → Simpan sebagai pengingat\n\n"
         "*💰 Catat Keuangan:*\n"
-        "Langsung ketik natural:\n"
-        "\"beli bensin 50rb\" → otomatis tercatat\n"
-        "\"gaji masuk 5jt\" → otomatis tercatat\n\n"
-        "*💬 Asisten Umum:*\n"
-        "Langsung tanya saja!\n\n"
+        "Tulis natural: _'beli makan 35rb'_, _'gajian 5jt'_\n\n"
+        "*📖 Buat Cerita:*\n"
+        "1. Kirim 2-8 foto momen keluarga\n"
+        "2. Jawab pertanyaan Kwek\n"
+        "3. Cerita indah jadi!\n\n"
         "*⌨️ Commands:*\n"
         "/cerita - Mulai sesi cerita\n"
         "/selesai - Foto sudah semua\n"
         "/batal - Batalkan sesi\n"
-        "/keuangan - Ringkasan keuangan\n"
-        "/status - Cek status database\n"
-        "/help - Panduan ini",
+        "/status - Statistik data\n"
+        "/keuangan - Ringkasan keuangan\n",
         parse_mode="Markdown"
     )
 
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    if not member:
+        await update.message.reply_text("🦆 Kwak! Tidak bisa ambil data.")
+        return
+
+    stories = await db.select("stories", f"member_id=eq.{member['id']}&select=id")
+    transactions = await db.select("finance_transactions", f"member_id=eq.{member['id']}&select=id")
+    photos = await db.select("story_photos", "select=id")
+
+    await update.message.reply_text(
+        f"📊 *Status Kwek Family System*\n\n"
+        f"👤 Nama: {member.get('full_name', '-')}\n"
+        f"📖 Total cerita: {len(stories)}\n"
+        f"📸 Total foto tersimpan: {len(photos)}\n"
+        f"💰 Total transaksi: {len(transactions)}\n\n"
+        f"🗄️ Storage: Supabase aktif ✅\n"
+        f"🤖 AI: Claude aktif ✅",
+        parse_mode="Markdown"
+    )
+
+async def cmd_keuangan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    if not member:
+        await update.message.reply_text("🦆 Kwak! Tidak bisa ambil data.")
+        return
+
+    now = datetime.now(timezone.utc)
+    month_start = now.strftime("%Y-%m-01")
+    transactions = await db.select(
+        "finance_transactions",
+        f"member_id=eq.{member['id']}&created_at=gte.{month_start}&select=type,amount,description"
+    )
+
+    income = sum(t["amount"] for t in transactions if t["type"] == "income")
+    expense = sum(t["amount"] for t in transactions if t["type"] == "expense")
+    balance = income - expense
+
+    def fmt(n): return f"Rp {n:,.0f}".replace(",", ".")
+
+    await update.message.reply_text(
+        f"💰 *Keuangan Bulan Ini*\n\n"
+        f"✅ Pemasukan: {fmt(income)}\n"
+        f"🛒 Pengeluaran: {fmt(expense)}\n"
+        f"{'🟢' if balance >= 0 else '🔴'} Saldo: {fmt(balance)}\n\n"
+        f"Total {len(transactions)} transaksi tercatat.",
+        parse_mode="Markdown"
+    )
 
 async def cmd_cerita(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     reset_sess(chat_id)
     sess = get_sess(chat_id)
     sess["mode"] = "collecting"
-    sess["story_author"] = update.effective_user.first_name
-    sess["story_author_id"] = update.effective_user.id
-    sess["story_member_uuid"] = await ensure_member(update.effective_user)
+    sess["context"] = "story"
     await update.message.reply_text(
         "🎬 *Sesi Cerita Dimulai!*\n\n"
         "Kirim foto-foto momen kalian (2-8 foto).\n"
@@ -422,7 +441,6 @@ async def cmd_cerita(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🦆 _Kwek siap jadi sutradara!_",
         parse_mode="Markdown"
     )
-
 
 async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -450,140 +468,128 @@ async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🦆 Kwak! Ada gangguan. Coba /cerita lagi ya.")
         reset_sess(chat_id)
 
-
 async def cmd_batal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reset_sess(update.effective_chat.id)
     await update.message.reply_text("🦆 Sesi dibatalkan. Kapan saja mau mulai lagi, ketik /cerita!")
 
-
-async def cmd_keuangan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not db:
-        await update.message.reply_text("🦆 Database belum terhubung!")
-        return
-
-    now = datetime.now(timezone(timedelta(hours=7)))
-    month_start = now.strftime("%Y-%m-01")
-
-    txs = await db.select(
-        "finance_transactions",
-        f"transaction_date=gte.{month_start}&order=transaction_date.desc",
-        limit=100
-    )
-
-    if not txs:
-        await update.message.reply_text(
-            f"🦆 Belum ada catatan keuangan di bulan {now.strftime('%B %Y')}.\n\n"
-            "Mulai catat dengan ketik langsung, contoh:\n"
-            "\"beli makan 25rb di warteg\"\n"
-            "\"bayar listrik 350rb\""
-        )
-        return
-
-    total_expense = sum(abs(t["amount"]) for t in txs if t["type"] == "expense")
-    total_income = sum(t["amount"] for t in txs if t["type"] == "income")
-    tx_count = len(txs)
-
-    fmt_exp = f"Rp {total_expense:,.0f}".replace(",", ".")
-    fmt_inc = f"Rp {total_income:,.0f}".replace(",", ".")
-    fmt_net = f"Rp {total_income - total_expense:,.0f}".replace(",", ".")
-
-    recent = txs[:5]
-    recent_lines = []
-    for t in recent:
-        amt = abs(t["amount"])
-        emoji = "🔴" if t["type"] == "expense" else "🟢"
-        recent_lines.append(f"{emoji} Rp {amt:,.0f}".replace(",", ".") + f" — {t.get('description', '-')}")
-
-    await update.message.reply_text(
-        f"💰 *Keuangan {now.strftime('%B %Y')}*\n\n"
-        f"📊 Total {tx_count} transaksi\n"
-        f"🟢 Pemasukan: *{fmt_inc}*\n"
-        f"🔴 Pengeluaran: *{fmt_exp}*\n"
-        f"📍 Saldo bersih: *{fmt_net}*\n\n"
-        f"*5 Transaksi Terakhir:*\n" + "\n".join(recent_lines) + "\n\n"
-        f"🦆 _Ketik pengeluaran/pemasukan kapan saja!_",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not db:
-        await update.message.reply_text(
-            "🦆 Database belum terhubung.\n"
-            "Admin perlu setup SUPABASE_URL dan SUPABASE_KEY di Railway!"
-        )
-        return
-    try:
-        members = await db.select("family_members", "is_active=eq.true", limit=50)
-        stories = await db.select("stories", "order=created_at.desc", limit=1)
-        txs = await db.select("finance_transactions", "order=created_at.desc", limit=1)
-
-        story_info = f"📖 Cerita: {stories[0]['title'][:40]}..." if stories else "📖 Belum ada cerita"
-        tx_info = "💰 Keuangan aktif" if txs else "💰 Belum ada transaksi"
-
-        await update.message.reply_text(
-            "🦆 *Status Kwek Family Hub*\n\n"
-            f"✅ Database: Terhubung\n"
-            f"👨‍👩‍👧‍👦 Anggota: {len(members)} orang\n"
-            f"{story_info}\n"
-            f"{tx_info}\n\n"
-            "Semua sistem berjalan normal! 🟢",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Status check error: {e}")
-        await update.message.reply_text("🦆 Ada masalah koneksi ke database. Coba lagi nanti ya!")
-
-
-# ============================================
-# PHOTO & TEXT HANDLERS
-# ============================================
+# ─── PHOTO HANDLER ────────────────────────────────────────────────────────────
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user = update.effective_user
     sess = get_sess(chat_id)
-    if sess["mode"] == "idle":
-        sess["mode"] = "collecting"
-        sess["story_author"] = update.effective_user.first_name
-        sess["story_author_id"] = update.effective_user.id
-        sess["story_member_uuid"] = await ensure_member(update.effective_user)
-        await update.message.reply_text(
-            "🦆 Ada foto nih! Kirim semua foto momennya dulu.\n"
-            "Kalau sudah semua, ketik */selesai* ya!",
-            parse_mode="Markdown"
-        )
-    if sess["mode"] != "collecting":
-        return
-    if len(sess["photos"]) >= 8:
-        await update.message.reply_text("🦆 Sudah 8 foto, cukup! Ketik /selesai untuk lanjut.")
-        return
+
+    # Download foto
     photo_file = await ctx.bot.get_file(update.message.photo[-1].file_id)
     async with httpx.AsyncClient() as client:
         r = await client.get(photo_file.file_path)
-        b64 = base64.b64encode(r.content).decode()
-    sess["photos"].append(b64)
-    n = len(sess["photos"])
-    if n == 1:
-        await update.message.reply_text("🦆 Foto 1 masuk! Kirim lagi ya (min. 2 foto).")
-    elif n < 8:
+        raw_bytes = r.content
+        b64 = base64.b64encode(raw_bytes).decode()
+
+    # Jika sesi cerita sedang berjalan, tambahkan ke sesi
+    if sess["mode"] == "collecting":
+        if len(sess["photos"]) >= 8:
+            await update.message.reply_text("🦆 Sudah 8 foto, cukup! Ketik /selesai untuk lanjut.")
+            return
+        sess["photos"].append(b64)
+        sess["photo_bytes"].append(raw_bytes)
+        n = len(sess["photos"])
+        if n == 1:
+            await update.message.reply_text("🦆 Foto 1 masuk! Kirim lagi ya (min. 2 foto).")
+        else:
+            await update.message.reply_text(
+                f"🦆 Foto {n} masuk ✅\nKirim lagi atau */selesai* kalau sudah semua.",
+                parse_mode="Markdown"
+            )
+        return
+
+    # Foto pertama di sesi idle — deteksi konteks
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    await update.message.reply_text("🦆 Sebentar, aku analisis fotonya dulu... 🔍")
+
+    ctx_info = await detect_photo_context(b64)
+    photo_context = ctx_info.get("context", "story")
+    description = ctx_info.get("description", "foto")
+
+    member = await ensure_member(user.id, user.username, user.full_name)
+    member_id = member["id"] if member else None
+
+    if photo_context == "finance":
+        # Struk / nota → upload + parse → catat keuangan
+        photo_url = await upload_photo_to_storage(raw_bytes, "finance", member_id)
         await update.message.reply_text(
-            f"🦆 Foto {n} masuk ✅\nKirim lagi atau */selesai* kalau sudah semua.",
+            f"🧾 Sepertinya ini struk/nota!\n_{description}_\n\n"
+            "Sebentar, aku baca totalnya... 💰",
+            parse_mode="Markdown"
+        )
+        try:
+            parsed_text = await call_claude(
+                messages=[{"role": "user", "content": "Baca struk/nota ini. Extract: nama toko, total belanja, tanggal jika ada. Lalu format sebagai transaksi keuangan."}],
+                system=SYSTEM_FINANCE_PARSER,
+                images=[b64]
+            )
+            clean = parsed_text.strip().replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(clean)
+            if parsed.get("is_transaction"):
+                saved = await save_finance(member_id, parsed, photo_url)
+                amt = parsed.get("amount", 0)
+                desc = parsed.get("description", "")
+                await update.message.reply_text(
+                    f"✅ *Tercatat!*\n\n"
+                    f"💸 {desc}: Rp {amt:,.0f}\n"
+                    f"📂 Kategori: {parsed.get('category', 'Lainnya')}\n"
+                    f"📸 Foto struk tersimpan ✅",
+                    parse_mode="Markdown"
+                )
+            else:
+                await update.message.reply_text(
+                    "🦆 Foto tersimpan, tapi aku tidak bisa baca totalnya.\n"
+                    "Mau catat manual? Contoh: _'beli ini 50rb'_",
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.error(f"Finance photo parse error: {e}")
+            await update.message.reply_text("🦆 Foto tersimpan, tapi gagal baca otomatis. Catat manual ya!")
+
+    elif photo_context == "misc":
+        # Foto pengingat / objek → upload + simpan
+        photo_url = await upload_photo_to_storage(raw_bytes, "misc", member_id)
+        await save_misc_photo(member_id, photo_url, description)
+        await update.message.reply_text(
+            f"📌 *Foto tersimpan sebagai pengingat!*\n\n"
+            f"_{description}_\n\n"
+            f"Foto bisa kamu lihat lagi nanti dari dashboard. ✅",
             parse_mode="Markdown"
         )
 
+    else:
+        # Foto momen → mulai sesi cerita
+        sess["mode"] = "collecting"
+        sess["context"] = "story"
+        sess["photos"].append(b64)
+        sess["photo_bytes"].append(raw_bytes)
+        await update.message.reply_text(
+            f"🦆 Wah, foto momen keluarga nih!\n_{description}_\n\n"
+            "Kirim semua foto momennya dulu ya.\n"
+            "Kalau sudah semua, ketik */selesai*! 📸",
+            parse_mode="Markdown"
+        )
 
+# ─── TEXT HANDLER ─────────────────────────────────────────────────────────────
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user = update.effective_user
     sess = get_sess(chat_id)
     text = update.message.text.strip()
-    user = update.effective_user
 
-    # MODE: Interviewing for story
+    member = await ensure_member(user.id, user.username, user.full_name)
+    member_id = member["id"] if member else None
+
     if sess["mode"] == "interviewing":
         sess["history"].append({"role": "user", "content": text})
         MAX_Q = 4
         if sess["q_count"] >= MAX_Q:
             await update.message.reply_text("🦆 Oke! Sekarang aku buatkan ceritanya... ✨")
-            await generate_story(update, ctx, sess)
+            await generate_story(update, ctx, sess, member_id)
             reset_sess(chat_id)
             return
         try:
@@ -603,39 +609,59 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🦆 Koneksi bermasalah, coba jawab lagi ya!")
         return
 
-    # MODE: Normal chat — try finance first, then general
+    # Mode idle — coba deteksi transaksi keuangan
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    parsed = await try_parse_finance(text)
+    if parsed:
+        saved = await save_finance(member_id, parsed)
+        amt = parsed.get("amount", 0)
+        desc = parsed.get("description", "")
+        t_type = "💰 Pemasukan" if parsed.get("type") == "income" else "💸 Pengeluaran"
+        await update.message.reply_text(
+            f"✅ *Tercatat!*\n\n"
+            f"{t_type}: {desc}\n"
+            f"Rp {amt:,.0f}\n"
+            f"📂 {parsed.get('category', 'Lainnya')}",
+            parse_mode="Markdown"
+        )
+        await log_activity(member_id, "finance_add", {"amount": amt, "description": desc})
+        return
+
+    # Asisten umum
     try:
-        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-        if db:
-            finance_reply = await try_parse_finance(text, user, chat_id)
-            if finance_reply:
-                await update.message.reply_text(finance_reply, parse_mode="Markdown")
-                return
-
         sess["general"].append({"role": "user", "content": text})
         if len(sess["general"]) > 12:
             sess["general"] = sess["general"][-12:]
         reply = await call_claude(messages=sess["general"], system=SYSTEM_KWEK)
         sess["general"].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
+        await log_activity(member_id, "general_chat", {"text": text[:100]})
     except Exception as e:
         logger.error(e)
         await update.message.reply_text("🦆 Kwak! Ada gangguan sebentar. Coba lagi ya!")
 
-
-# ============================================
-# STORY GENERATION + SAVE
-# ============================================
-async def generate_story(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess: dict):
+# ─── STORY GENERATOR ──────────────────────────────────────────────────────────
+async def generate_story(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess: dict, member_id: int):
     chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or "Private Chat"
+
+    # Upload semua foto ke Storage
+    await update.message.reply_text("📤 Mengupload foto ke storage... ⏳")
+    photo_urls = []
+    for i, raw_bytes in enumerate(sess["photo_bytes"]):
+        url = await upload_photo_to_storage(raw_bytes, "stories", member_id)
+        if url:
+            photo_urls.append(url)
+            logger.info(f"Foto {i+1} uploaded: {url}")
+
+    uploaded_count = len(photo_urls)
+    await update.message.reply_text(
+        f"✅ {uploaded_count}/{len(sess['photos'])} foto tersimpan!\nSekarang aku tulis ceritanya... ✍️"
+    )
 
     qa = "\n".join([
         f"{'Keluarga' if m['role']=='user' else 'Kwek'}: {m['content']}"
         for m in sess["history"] if isinstance(m.get("content"), str)
     ])
-
     prompt = f"""Berdasarkan {len(sess['photos'])} foto dan hasil interview:
 
 {qa}
@@ -664,46 +690,26 @@ Buatkan cerita keluarga yang indah. Format:
             system=SYSTEM_STORY,
             images=sess["photos"][:4]
         )
+        # Simpan cerita ke database
+        saved = await save_story(member_id, story, photo_urls, sess["history"])
+        story_id = saved["id"] if saved else "?"
 
         await update.message.reply_text(
             f"📖 *CERITA KALIAN SUDAH JADI!*\n\n{story}",
             parse_mode="Markdown"
         )
-
-        saved = await save_story(
-            chat_id=chat_id,
-            chat_title=chat_title,
-            author_name=sess.get("story_author", ""),
-            author_tg_id=sess.get("story_author_id", 0),
-            photo_count=len(sess["photos"]),
-            story_text=story,
-            interview_qa=qa,
-            member_id=sess.get("story_member_uuid"),
+        await update.message.reply_text(
+            f"🦆 Cerita tersimpan permanen di database! (ID: #{story_id})\n"
+            f"📸 {uploaded_count} foto sudah aman di storage.\n\n"
+            "Ketik /cerita untuk buat cerita baru, atau tanya apapun ke Kwek ya 💛"
         )
+        await log_activity(member_id, "story_created", {"story_id": story_id, "photo_count": uploaded_count})
 
-        if saved:
-            await update.message.reply_text(
-                f"🦆 Cerita tersimpan permanen! 💾\n"
-                f"ID: `{saved.get('story_code', '')}`\n\n"
-                "Semoga jadi kenangan indah keluarga kalian!\n"
-                "Ketik /cerita untuk buat cerita baru 💛",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                "🦆 Semoga jadi kenangan indah keluarga kalian!\n"
-                "⚠️ _Cerita belum tersimpan ke database._\n\n"
-                "Ketik /cerita untuk buat cerita baru 💛",
-                parse_mode="Markdown"
-            )
     except Exception as e:
         logger.error(e)
         await update.message.reply_text("🦆 Aduh gagal buat cerita! Coba /cerita lagi ya.")
 
-
-# ============================================
-# MAIN
-# ============================================
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -711,15 +717,12 @@ def main():
     app.add_handler(CommandHandler("cerita", cmd_cerita))
     app.add_handler(CommandHandler("selesai", cmd_selesai))
     app.add_handler(CommandHandler("batal", cmd_batal))
-    app.add_handler(CommandHandler("keuangan", cmd_keuangan))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("keuangan", cmd_keuangan))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    db_status = "✅ Supabase" if db else "⚠️ No DB"
-    logger.info(f"🦆 Kwek Bot is running! ({db_status})")
+    logger.info("🦆 Kwek Bot is running with Supabase Storage!")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
