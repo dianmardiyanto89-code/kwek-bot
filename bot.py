@@ -249,7 +249,11 @@ async def call_claude_json(messages: list, system: str, images: list = None) -> 
     try:
         raw   = await call_claude(messages, system, images)
         clean = raw.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+        result = json.loads(clean)
+        # Kalau Claude return array, ambil element pertama
+        if isinstance(result, list):
+            result = result[0] if result else None
+        return result if isinstance(result, dict) else None
     except Exception as e:
         logger.error(f"call_claude_json: {e}")
         return None
