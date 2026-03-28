@@ -534,11 +534,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 sess["photos"].append(b64)
                 sess["photo_bytes"].append(raw_bytes)
                 await ctx.bot.send_message(chat_id,
-                    "⚡ *Mode Cerita Cepat!*
-
-Foto masuk (1/8).
-"
-                    "Kirim foto lagi atau /selesai lalu tulis ceritamu!",
+                    "⚡ *Mode Cerita Cepat!*\n\nFoto masuk (1/8).\nKirim foto lagi atau /selesai lalu tulis ceritamu!",
                     parse_mode="Markdown")
         elif data == "foto_ceritalengkap":
             if b64 and raw_bytes:
@@ -547,11 +543,7 @@ Foto masuk (1/8).
                 sess["photos"].append(b64)
                 sess["photo_bytes"].append(raw_bytes)
                 await ctx.bot.send_message(chat_id,
-                    "🎬 *Mode Cerita Lengkap!*
-
-Foto masuk (1/8).
-"
-                    "Kirim foto lagi atau /selesai untuk mulai wawancara!",
+                    "🎬 *Mode Cerita Lengkap!*\n\nFoto masuk (1/8).\nKirim foto lagi atau /selesai untuk mulai wawancara!",
                     parse_mode="Markdown")
         elif data == "foto_reminder":
             if raw_bytes:
@@ -804,12 +796,7 @@ async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess.get("story_mode") == "quick":
         sess["mode"] = "awaiting_story_text"
         await update.message.reply_text(
-            f"✅ *{n} foto diterima!*
-
-"
-            "Sekarang tulis ceritamu — bebas, natural, dari hati.
-"
-            "Kwek akan simpan jadi kenangan indah keluarga 📝",
+            f"✅ *{n} foto diterima!*\n\nSekarang tulis ceritamu — bebas, natural, dari hati.\nKwek akan simpan jadi kenangan indah keluarga 📝",
             parse_mode="Markdown"
         )
         return
@@ -1026,12 +1013,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         story_id = saved["id"] if saved else "?"
         reset_sess(chat_id)
         await update.message.reply_text(
-            f"✅ *Cerita tersimpan!*
-
-_{text[:200]}{'...' if len(text)>200 else ''}_
-
-"
-            f"📸 {len(photo_urls)} foto · ID: #{story_id}",
+            f"\u2705 *Cerita tersimpan!*\n\n_{text[:200]}_\n\n\U0001f4f8 {len(photo_urls)} foto \u00b7 ID: #{story_id}",
             parse_mode="Markdown"
         )
         await log_activity(member_id, "story_quick", {"story_id": story_id})
