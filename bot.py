@@ -527,6 +527,34 @@ async def job_sore(context):
         parse_mode="Markdown"
     )
 
+async def job_dashboard_notif(context):
+    """Poll bot_activity_log untuk kirim notif tugas selesai dari dashboard"""
+    try:
+        import datetime as dt
+        # Ambil log yang belum diproses (5 menit terakhir)
+        since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat()
+        logs = await db.select("bot_activity_log",
+            f"action_type=eq.task_completed_dashboard&created_at=gte.{since}&select=id,action_detail,created_at")
+        if not logs: return
+        for log in logs:
+            detail = log.get("action_detail", {})
+            title  = detail.get("task_title", "Tugas")
+            name   = detail.get("completed_by_name", "Seseorang")
+            GROUP_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))
+            if GROUP_ID:
+                try:
+                    await context.bot.send_message(
+                        GROUP_ID,
+                        f"✅ *{title}*\n"
+                        f"Selesai oleh *{name}* via dashboard 💪",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.warning(f"Notif tugas gagal: {e}")
+    except Exception as e:
+        logger.error(f"job_dashboard_notif: {e}")
+
+
 async def job_habit_reminder(context):
     """17.00 WIB — Reminder habit sore hari"""
     import datetime as dt
@@ -1509,6 +1537,7 @@ def main():
     job_queue.run_daily(job_sore,  time=time(10,  0, 0, tzinfo=timezone.utc))  # 17.00 WIB
     job_queue.run_daily(job_malam, time=time(13, 30, 0, tzinfo=timezone.utc))  # 20.30 WIB
     job_queue.run_daily(job_habit_reminder, time=time(10, 0, 0, tzinfo=timezone.utc))  # 17.00 WIB
+    job_queue.run_repeating(job_dashboard_notif, interval=300, first=10)  # Poll tiap 5 menit
 
     logger.info("Kwek Bot running! wartawan + mood channel + journal + scheduler")
     app.run_polling(drop_pending_updates=True)
