@@ -303,11 +303,14 @@ async def curate_journal(raw_text: str, member_name: str) -> str:
 async def ensure_member(telegram_id: int, username: str = None, full_name: str = None) -> dict | None:
     existing = await db.select("family_members", f"telegram_id=eq.{telegram_id}")
     if existing: return existing[0]
+    # Auto-register member baru
+    logger.info(f"Auto-register member baru: {full_name} ({telegram_id})")
     return await db.insert("family_members", {
         "telegram_id": telegram_id,
-        "username":    username or f"user_{telegram_id}",
-        "full_name":   full_name or "Anggota Keluarga",
-        "role":        "member"
+        "name":        username or f"user_{telegram_id}",
+        "full_name":   full_name or username or "Anggota Keluarga",
+        "role":        "member",
+        "is_active":   True
     })
 
 async def upload_photo(image_bytes: bytes, folder: str, member_id: str) -> str | None:
@@ -487,6 +490,43 @@ async def job_sore(context):
         text=teks,
         parse_mode="Markdown"
     )
+
+async def job_habit_reminder(context):
+    """17.00 WIB — Reminder habit sore hari"""
+    import datetime as dt
+    try:
+        today         = dt.date.today().isoformat()
+        today_weekday = dt.date.today().isoweekday()
+        members       = await db.select("family_members", "select=id,full_name,telegram_id")
+        for m in members:
+            if not m.get("telegram_id"): continue
+            habits = await db.select("habits", f"member_id=eq.{m['id']}&is_active=eq.true&select=id,name,emoji,schedule,custom_days")
+            if not habits: continue
+            due = []
+            for h in habits:
+                if h["schedule"] == "daily": due.append(h)
+                elif h["schedule"] == "weekdays" and today_weekday <= 5: due.append(h)
+                elif h["schedule"] == "weekends" and today_weekday >= 6: due.append(h)
+                elif h["schedule"] == "custom" and today_weekday in (h.get("custom_days") or []): due.append(h)
+            if not due: continue
+            done_logs = await db.select("habit_logs", f"member_id=eq.{m['id']}&log_date=eq.{today}&is_done=eq.true&select=habit_id")
+            done_ids  = {d["habit_id"] for d in done_logs}
+            undone    = [h for h in due if h["id"] not in done_ids]
+            if not undone: continue
+            habit_list  = "\n".join([f"{h.get('emoji','✅')} {h['name']}" for h in undone])
+            name_first  = (m.get("full_name") or "").split()[0] or "Hei"
+            try:
+                await context.bot.send_message(
+                    m["telegram_id"],
+                    f"⏰ *{name_first}, habit hari ini belum selesai:*\n\n{habit_list}\n\n"
+                    "Ketik `done [nama habit]` kalau sudah! 💪",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"Habit reminder gagal: {e}")
+    except Exception as e:
+        logger.error(f"job_habit_reminder: {e}")
+
 
 async def job_malam(context):
     """20.30 WIB — Reminder malam jika belum isi jurnal"""
@@ -826,21 +866,178 @@ async def cmd_selesai(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_batal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sess    = get_sess(chat_id)
-    # Kalau sedang interview, tawari simpan langsung
     if sess["mode"] == "interviewing" and sess["photos"]:
         reset_sess(chat_id)
         await update.message.reply_text(
             "Sesi dibatalkan.\n\n"
-            "💡 _Untuk cerita cepat tanpa interview: kirim foto + tulis caption langsung!_",
+            "💡 _Untuk cerita cepat: kirim foto + caption langsung!_",
             parse_mode="Markdown"
         )
     else:
         reset_sess(chat_id)
+        await update.message.reply_text("Sesi dibatalkan. Siap!")
+
+
+# ── HABIT TRACKER ──────────────────────────────────────────────────────────
+
+SYSTEM_HABIT_PARSER = """Kamu adalah parser habit tracker keluarga.
+Ekstrak informasi habit dari teks dan return JSON ONLY:
+{
+  "name": "nama habit singkat",
+  "emoji": "emoji relevan",
+  "target_desc": "deskripsi target spesifik",
+  "schedule": "daily|weekdays|weekends|custom",
+  "custom_days": [1,2,3,4,5,6,7],
+  "valid": true/false
+}
+schedule: daily=setiap hari, weekdays=Senin-Jumat, weekends=Sabtu-Minggu, custom=pilihan sendiri
+custom_days: 1=Senin, 2=Selasa, ..., 7=Minggu
+Contoh: "push up 10x setiap hari" → name:"Push up 10x", schedule:"daily"
+Contoh: "ngaji senin-jumat" → name:"Ngaji", schedule:"weekdays"
+Contoh: "puasa senin kamis" → schedule:"custom", custom_days:[1,4]"""
+
+
+async def cmd_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(ctx.args) if ctx.args else ""
+    user = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    if not member:
+        await update.message.reply_text("Kwak! Tidak bisa ambil data member.")
+        return
+
+    if not text:
+        # Tampilkan habit yang sudah ada
+        habits = await db.select("habits", f"member_id=eq.{member['id']}&is_active=eq.true&select=name,emoji,schedule,target_desc")
+        if not habits:
+            await update.message.reply_text(
+                "📋 *Habit Trackermu*\n\n"
+                "Belum ada habit. Tambah habit:\n"
+                "`/habit push up 10x setiap hari`\n"
+                "`/habit ngaji 1 halaman senin-jumat`\n"
+                "`/habit puasa senin kamis`",
+                parse_mode="Markdown"
+            )
+        else:
+            sched_label = {"daily":"setiap hari","weekdays":"Senin-Jumat","weekends":"Sabtu-Minggu","custom":"hari tertentu"}
+            habit_list = "\n".join([f"{h.get('emoji','✅')} *{h['name']}* — _{sched_label.get(h['schedule'],'—')}_" for h in habits])
+            await update.message.reply_text(
+                f"📋 *Habitmu saat ini:*\n\n{habit_list}\n\n"
+                "Untuk tambah: `/habit nama habit jadwalnya`",
+                parse_mode="Markdown"
+            )
+        return
+
+    # Parse habit baru
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    parsed = await call_claude_json(
+        messages=[{"role":"user","content":f"Parse habit ini: {text}"}],
+        system=SYSTEM_HABIT_PARSER
+    )
+
+    if not parsed or not parsed.get("valid"):
         await update.message.reply_text(
-            "Sesi dibatalkan. Ketik /cerita untuk mulai lagi!\n\n"
-            "💡 _Tips: Kirim foto + caption untuk simpan cerita instan!_",
+            "Kwak! Kurang jelas nih. Coba lebih spesifik:\n"
+            "`/habit push up 10x setiap hari`\n"
+            "`/habit ngaji 1 halaman senin-jumat`"
+        )
+        return
+
+    # Simpan ke Supabase
+    res = await db.insert("habits", {
+        "member_id":   member["id"],
+        "name":        parsed["name"],
+        "emoji":       parsed.get("emoji", "✅"),
+        "target_desc": parsed.get("target_desc", text),
+        "schedule":    parsed.get("schedule", "daily"),
+        "custom_days": parsed.get("custom_days", [1,2,3,4,5,6,7]),
+        "is_active":   True
+    })
+
+    if res:
+        sched_label = {"daily":"setiap hari","weekdays":"Senin-Jumat","weekends":"Sabtu-Minggu","custom":"hari tertentu"}
+        await update.message.reply_text(
+            f"{parsed.get('emoji','✅')} *Habit ditambahkan!*\n\n"
+            f"*{parsed['name']}*\n"
+            f"Jadwal: _{sched_label.get(parsed.get('schedule','daily'))}_\n\n"
+            "Aku akan ingatkan setiap harinya! 🦆",
             parse_mode="Markdown"
         )
+    else:
+        await update.message.reply_text("Kwak! Gagal simpan habit. Coba lagi ya.")
+
+
+async def cmd_done_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle ketik 'done [nama habit]' atau '/done [nama habit]'"""
+    text = " ".join(ctx.args) if ctx.args else ""
+    user = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    if not member: return
+
+    today = datetime.date.today().isoformat()
+    habits = await db.select("habits", f"member_id=eq.{member['id']}&is_active=eq.true&select=id,name,emoji")
+
+    if not habits:
+        await update.message.reply_text("Belum ada habit. Tambah dulu: `/habit nama habit jadwal`", parse_mode="Markdown")
+        return
+
+    if not text:
+        # Tampilkan list habit untuk dipilih
+        habit_list = "\n".join([f"{i+1}. {h.get('emoji','✅')} {h['name']}" for i,h in enumerate(habits)])
+        await update.message.reply_text(
+            f"✅ *Habit mana yang sudah selesai?*\n\n{habit_list}\n\n"
+            "Ketik `/done [nomor atau nama]`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Cari habit yang dimaksud
+    matched = None
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(habits):
+            matched = habits[idx]
+    else:
+        text_lower = text.lower()
+        for h in habits:
+            if text_lower in h["name"].lower():
+                matched = h; break
+
+    if not matched:
+        await update.message.reply_text(f"Habit '{text}' tidak ditemukan.")
+        return
+
+    # Catat ke habit_logs
+    res = await db.insert("habit_logs", {
+        "habit_id":  matched["id"],
+        "member_id": member["id"],
+        "log_date":  today,
+        "is_done":   True
+    })
+    if res:
+        name_first = member["full_name"].split()[0] if member.get("full_name") else "Kamu"
+        await update.message.reply_text(
+            f"{matched.get('emoji','✅')} *{matched['name']}* selesai hari ini!\n"
+            f"Semangat {name_first}! 🔥",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("Sudah tercatat sebelumnya hari ini!")
+
+
+# ── PANIC / DARURAT ────────────────────────────────────────────────────────
+
+async def cmd_darurat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user   = update.effective_user
+    member = await ensure_member(user.id, user.username, user.full_name)
+    chat_id = update.effective_chat.id
+    sess    = get_sess(chat_id)
+    sess["awaiting_darurat"] = True
+    await update.message.reply_text(
+        "🚨 *MODE DARURAT*\n\n"
+        "Apa yang harus semua anggota keluarga tahu *segera*?\n\n"
+        "_Tulis pesannya sekarang — akan langsung muncul di dashboard semua orang_",
+        parse_mode="Markdown"
+    )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user   = update.effective_user
@@ -1008,6 +1205,39 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Koneksi bermasalah, coba lagi ya!")
         return
 
+    # ── Mode awaiting darurat ──
+    if sess.get("awaiting_darurat"):
+        sess["awaiting_darurat"] = False
+        user   = update.effective_user
+        member = await ensure_member(user.id, user.username, user.full_name)
+        sender = member["full_name"] if member else user.full_name or "Anggota"
+        # Simpan ke Supabase
+        await db.insert("emergency_alerts", {
+            "message":     text,
+            "created_by":  member["id"] if member else None,
+            "sender_name": sender,
+            "is_active":   True
+        })
+        # Broadcast ke grup
+        GROUP_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))
+        if GROUP_ID:
+            try:
+                await ctx.bot.send_message(
+                    GROUP_ID,
+                    f"🚨 *PESAN DARURAT dari {sender}*\n\n_{text}_\n\n"
+                    "_Buka dashboard untuk konfirmasi_",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Broadcast darurat gagal: {e}")
+        await update.message.reply_text(
+            f"🚨 Pesan darurat terkirim!\n\n"
+            f"*\"{text}\"*\n\n"
+            "Akan muncul di dashboard semua anggota keluarga.",
+            parse_mode="Markdown"
+        )
+        return
+
     # ── Mode awaiting story text (cerita cepat) ──
     if sess.get("mode") == "awaiting_story_text":
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -1024,6 +1254,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         await log_activity(member_id, "story_quick", {"story_id": story_id})
+        return
+
+    # ── Trigger: done / selesai [nama habit] ──
+    text_lower_h = text.lower().strip()
+    if text_lower_h.startswith("done ") or text_lower_h.startswith("selesai "):
+        habit_kw = text[5:].strip() if text_lower_h.startswith("done ") else text[7:].strip()
+        ctx.args = [habit_kw]
+        await cmd_done_habit(update, ctx)
         return
 
     # ── Mode awaiting journal ──
@@ -1151,6 +1389,7 @@ def main():
         ("start", cmd_start), ("help", cmd_help), ("cerita", cmd_cerita),
         ("selesai", cmd_selesai), ("batal", cmd_batal), ("status", cmd_status),
         ("ceritalengkap", cmd_ceritalengkap), ("ceritacepat", cmd_ceritacepat),
+        ("habit", cmd_habit), ("done", cmd_done_habit), ("darurat", cmd_darurat),
         ("keuangan", cmd_keuangan), ("struk", cmd_struk), ("foto", cmd_foto),
         ("reminder", cmd_reminder), ("tugas", cmd_tugas),
         ("channel", cmd_channel), ("kabar", cmd_kabar), ("jurnal", cmd_jurnal),
@@ -1167,6 +1406,7 @@ def main():
     job_queue.run_daily(job_pagi,  time=time(23, 30, 0, tzinfo=timezone.utc))  # 06.30 WIB
     job_queue.run_daily(job_sore,  time=time(10,  0, 0, tzinfo=timezone.utc))  # 17.00 WIB
     job_queue.run_daily(job_malam, time=time(13, 30, 0, tzinfo=timezone.utc))  # 20.30 WIB
+    job_queue.run_daily(job_habit_reminder, time=time(10, 0, 0, tzinfo=timezone.utc))  # 17.00 WIB
 
     logger.info("Kwek Bot running! wartawan + mood channel + journal + scheduler")
     app.run_polling(drop_pending_updates=True)
