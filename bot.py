@@ -1105,7 +1105,7 @@ async def cmd_done_habit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     member = await ensure_member(user.id, user.username, user.full_name)
     if not member: return
 
-    today = datetime.date.today().isoformat()
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     habits = await db.select("habits", f"member_id=eq.{member['id']}&is_active=eq.true&select=id,name,emoji")
 
     if not habits:
@@ -1390,9 +1390,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Trigger: done / selesai [nama habit] ──
     text_lower_h = text.lower().strip()
+    if text_lower_h == "done" or text_lower_h == "selesai":
+        ctx.args = []
+        await cmd_done_habit(update, ctx)
+        return
     if text_lower_h.startswith("done ") or text_lower_h.startswith("selesai "):
-        habit_kw = text[5:].strip() if text_lower_h.startswith("done ") else text[7:].strip()
-        ctx.args = [habit_kw]
+        habit_kw = text[5:].strip() if text_lower_h.startswith("done ") else text[8:].strip()
+        ctx.args = [habit_kw] if habit_kw else []
         await cmd_done_habit(update, ctx)
         return
 
