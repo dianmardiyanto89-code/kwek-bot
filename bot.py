@@ -428,6 +428,42 @@ async def reply_finance(update: Update, parsed: dict, tx_type: str, extra: str =
         parse_mode="Markdown"
     )
 
+# ─── MOOD ────────────────────────────────────────────────────────────────────
+
+# Mood score: 5=sangat baik, 4=baik, 3=biasa, 2=kurang baik, 1=tidak baik
+MOOD_KEYBOARD_PAGI = InlineKeyboardMarkup([[
+    InlineKeyboardButton("😄", callback_data="mood_pagi_5"),
+    InlineKeyboardButton("😊", callback_data="mood_pagi_4"),
+    InlineKeyboardButton("😐", callback_data="mood_pagi_3"),
+    InlineKeyboardButton("😔", callback_data="mood_pagi_2"),
+    InlineKeyboardButton("😢", callback_data="mood_pagi_1"),
+]])
+
+MOOD_KEYBOARD_MALAM = InlineKeyboardMarkup([[
+    InlineKeyboardButton("😄", callback_data="mood_malam_5"),
+    InlineKeyboardButton("😊", callback_data="mood_malam_4"),
+    InlineKeyboardButton("😐", callback_data="mood_malam_3"),
+    InlineKeyboardButton("😔", callback_data="mood_malam_2"),
+    InlineKeyboardButton("😢", callback_data="mood_malam_1"),
+]])
+
+# Mood otomatis dari pilihan channel pagi
+CHANNEL_MOOD_MAP = {
+    "biasa":   3, "sedih":  2, "semangat": 5, "capek": 2,
+    "soleh":   4, "lucu":   4, "motivasi": 5, "funfact": 4,
+    "belajar": 4, "main":   4, "tidur":    3, "kejutan": 4,
+    "pagi":    3, "auto":   3,
+}
+
+# Mood label untuk respons
+MOOD_LABEL = {
+    5: "Wah, semangat banget! Hari yang bagus nih 🌟",
+    4: "Alhamdulillah, bagus! Semoga terus begitu ya 😊",
+    3: "Oke, biasa aja dulu — itu juga bagus kok 🌿",
+    2: "Hmm, agak berat ya. Kwek temani hari ini 💛",
+    1: "Kwek di sini ya. Mau cerita? Kwek dengerin 🤗",
+}
+
 # ─── SCHEDULER — BOT WARTAWAN ────────────────────────────────────────────────
 async def job_pagi(context):
     """06.30 WIB — Sapaan pagi + pilih mood channel"""
@@ -454,7 +490,7 @@ async def job_pagi(context):
             f"🌅 *Selamat pagi, {mention}!*\n"
             f"_{tgl}_\n\n"
             f"Hari ini Kwek mau temani kamu dengan apa?\n"
-            f"Pilih channel-mu hari ini:"
+            f"Pilih *Pesan Pagi*-mu hari ini:"
         ),
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -610,6 +646,39 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_message(chat_id, "📋 Foto tersimpan sebagai log aktivitas!")
         return
 
+    # ── Mood callback handler ──
+    if data.startswith("mood_pagi_") or data.startswith("mood_malam_"):
+        parts     = data.split("_")
+        mood_type = parts[1]   # "pagi" atau "malam"
+        score     = int(parts[2])
+        member    = await ensure_member(user.id, user.username, user.full_name)
+        if not member: return
+        member_id = member["id"]
+        name      = member.get("full_name", user.first_name or "Teman").split()[0]
+        today     = datetime.now(timezone.utc).date().isoformat()
+
+        # Update daily_journal
+        existing = await db.select("daily_journal",
+            f"member_id=eq.{member_id}&journal_date=eq.{today}")
+        field = f"mood_{mood_type}"
+        if existing:
+            await db.update("daily_journal",
+                f"member_id=eq.{member_id}&journal_date=eq.{today}",
+                {field: score})
+        else:
+            await db.insert("daily_journal", {
+                "member_id": member_id, "journal_date": today, field: score
+            })
+
+        await query.edit_message_reply_markup(reply_markup=None)
+        label = MOOD_LABEL.get(score, "Makasih ya! 💛")
+        await ctx.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"{'🌅' if mood_type=='pagi' else '🌙'} *{name}* — {label}",
+            parse_mode="Markdown"
+        )
+        return
+
     if not data.startswith("ch_"): return
 
     channel = data[3:]  # ambil nama channel
@@ -640,7 +709,33 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text=f"*{ch_label}*\n\n{content}",
         parse_mode="Markdown"
     )
-    await log_activity(member_id, "channel_selected", {"channel": channel})
+    # Catat mood otomatis dari pilihan channel
+    auto_mood = CHANNEL_MOOD_MAP.get(channel, 3)
+    today     = datetime.now(timezone.utc).date().isoformat()
+
+    # Upsert daily_journal mood_pagi
+    existing_journal = await db.select("daily_journal",
+        f"member_id=eq.{member_id}&journal_date=eq.{today}")
+    if existing_journal:
+        await db.update("daily_journal",
+            f"member_id=eq.{member_id}&journal_date=eq.{today}",
+            {"mood_pagi": auto_mood, "mood_channel": channel})
+    else:
+        await db.insert("daily_journal", {
+            "member_id":    member_id,
+            "journal_date": today,
+            "mood_pagi":    auto_mood,
+            "mood_channel": channel,
+            "raw_text":     f"Channel pagi: {ch_label}"
+        })
+
+    # Tanya mood lebih spesifik
+    await ctx.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"Btw {name}, hari ini kamu mulai dengan perasaan gimana? 🌅",
+        reply_markup=MOOD_KEYBOARD_PAGI
+    )
+    await log_activity(member_id, "channel_selected", {"channel": channel, "auto_mood": auto_mood})
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1279,6 +1374,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         await log_activity(member_id, "journal_add", {"length": len(text)})
+
+        # Tanya mood malam setelah jurnal tersimpan
+        name_first = name.split()[0] if name else "Kamu"
+        await update.message.reply_text(
+            f"Secara keseluruhan, hari ini gimana {name_first}? 🌙",
+            reply_markup=MOOD_KEYBOARD_MALAM
+        )
         return
 
     # ── Deteksi trigger ──
