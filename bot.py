@@ -68,6 +68,7 @@ FINANCE_EXPENSE_WORDS = {"catat", "cata", "catet", "keluar", "keluarin", "bayar"
 FINANCE_INCOME_WORDS  = {"masuk", "dapat", "terima", "gaji", "gajian", "pemasukan"}
 REMINDER_WORDS        = {"ingatkan", "ingatin", "reminder", "remind", "inget", "pengingat"}
 TASK_WORDS            = {"todo", "tugas", "kerjain", "task"}
+WISH_WORDS            = {"impian", "wishlist", "wish", "nabung", "mau beli", "ingin", "pengen beli", "target"}
 JOURNAL_WORDS         = {"kabar", "curhat", "cerita", "hari", "jurnal"}
 
 FINANCE_SYMBOL_RE = re.compile(r'^([+\-])\s*(\d[\d.,]*[kKmMrRbB]*)\s+(.+)$')
@@ -85,6 +86,7 @@ def detect_trigger(text: str) -> str:
     if first_word in REMINDER_WORDS or any(w in t for w in REMINDER_WORDS):
         return "reminder"
     if first_word in TASK_WORDS: return "task"
+    if first_word in WISH_WORDS or any(w in t for w in WISH_WORDS): return "wish"
     return "chat"
 
 def _edit_distance(a: str, b: str) -> int:
@@ -220,6 +222,13 @@ SYSTEM_TASK = """Kamu adalah parser tugas keluarga.
 Balas HANYA dengan JSON valid, tanpa teks lain.
 {"title":"Beli deterjen","notes":"Merk Rinso ukuran besar","priority":"medium"}
 priority: high=urgent, medium=default, low=santai."""
+
+SYSTEM_WISH = """Kamu adalah parser wishlist/impian keluarga.
+Balas HANYA dengan JSON valid, tanpa teks lain.
+{"title":"Liburan Bali","description":"Liburan keluarga ke Bali","wish_type":"travel","target_amount":5000000,"notes":null,"valid":true}
+wish_type: travel, gadget, vehicle, home, education, health, entertainment, fashion, food, other
+target_amount: angka dalam rupiah, 0 jika tidak disebutkan. 5jt=5000000, 500rb=500000.
+valid: false jika bukan wishlist."""
 
 SYSTEM_JOURNAL_CURATOR = """Kamu adalah kurator jurnal keluarga yang hangat dan puitis.
 Tugasmu: ubah curahan hati mentah menjadi catatan jurnal yang indah, personal, dan bermakna.
@@ -1442,6 +1451,45 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await log_activity(member_id, "reminder_add", {"title": parsed.get("title")})
         else:
             await update.message.reply_text("Gagal simpan pengingat. Coba lagi ya!")
+        return
+
+    if trigger == "wish":
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        parsed = await call_claude_json(
+            messages=[{"role":"user","content":f"Parse wishlist ini: {text}"}],
+            system=SYSTEM_WISH
+        )
+        if not parsed or not parsed.get("valid"):
+            await update.message.reply_text(
+                "Kwak! Coba lebih spesifik ya 🌟\n\n"
+                "Contoh:\n`impian liburan bali 5 juta`\n`wishlist beli motor 15 juta`\n`mau nabung hp baru 3 juta`"
+            )
+            return
+        res = await db.insert("wishes", {
+            "title":          parsed.get("title", text),
+            "description":    parsed.get("description"),
+            "wish_type":      parsed.get("wish_type", "other"),
+            "target_amount":  parsed.get("target_amount", 0),
+            "current_amount": 0,
+            "status":         "active",
+            "requested_by":   member_id,
+            "notes":          parsed.get("notes")
+        })
+        if res:
+            wicons = {"travel":"✈️","gadget":"📱","vehicle":"🚲","home":"🏠","education":"📚","health":"🏥","entertainment":"🎮","fashion":"👗","food":"🍜","other":"🌟"}
+            icon = wicons.get(parsed.get("wish_type","other"),"🌟")
+            def fmt(n): return f"{n/1000000:.1f}jt" if n>=1000000 else f"{n//1000}rb" if n>=1000 else str(n)
+            target_str = f" — target Rp {fmt(parsed['target_amount'])}" if parsed.get("target_amount") else ""
+            name_first = name.split()[0] if name else "Kamu"
+            await update.message.reply_text(
+                f"{icon} *Impian {name_first} ditambahkan!*\n\n"
+                f"*{parsed['title']}*{target_str}\n\n"
+                f"Semoga segera terwujud ya! ✨",
+                parse_mode="Markdown"
+            )
+            await log_activity(member_id, "wish_add", {"title": parsed.get("title")})
+        else:
+            await update.message.reply_text("Kwak! Gagal simpan impian. Coba lagi ya.")
         return
 
     if trigger == "task":
